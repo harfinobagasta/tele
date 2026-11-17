@@ -1,0 +1,15 @@
+# Environment variables & secrets (JANGAN DI-COMMIT)
+.env
+*.session
+*.session-journal
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# Logs
+logs/
+*.log

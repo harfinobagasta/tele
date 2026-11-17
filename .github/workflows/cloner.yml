@@ -1,0 +1,46 @@
+name: Telegram 24/7 Cloner & Translator
+
+on:
+  schedule:
+    # Failsafe cron: Berjalan otomatis setiap 5 jam untuk memastikan bot selalu hidup
+    - cron: '0 */5 * * *'
+  workflow_dispatch:
+    # Mengizinkan trigger manual dari tab Actions atau auto-retrigger dari script cloner.py
+
+concurrency:
+  group: telegram-channel-cloner
+  cancel-in-progress: false
+
+jobs:
+  run-cloner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355  # Timeout aman sebelum 360 menit (6 jam)
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Telegram Cloner & Auto-Translator
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+          DEST_CHANNEL: ${{ secrets.DEST_CHANNEL }}
+          SOURCE_CHANNELS: ${{ secrets.SOURCE_CHANNELS }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          MAX_RUNTIME_MINUTES: 330
+        run: |
+          python cloner.py

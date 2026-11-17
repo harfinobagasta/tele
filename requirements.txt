@@ -1,0 +1,6 @@
+pyrogram==2.0.106
+tgcrypto==1.2.5
+python-dotenv==1.0.1
+aiofiles==23.2.1
+deep-translator==1.11.4
+requests==2.34.2
