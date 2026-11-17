@@ -3,6 +3,7 @@
 ║  HISTORY CLONER + AUTO TRANSLATOR (1 MONTH FILTER)   ║
 ║  - Filter: Hanya menyalin pesan 30 hari terakhir     ║
 ║  - Terjemahan Otomatis: Mandarin/Cina -> English     ║
+║  - Preservasi Hyperlink & Referral Links Asli (HTML) ║
 ║  - Urutan: Terlama ke Terbaru (kronologis)           ║
 ╚══════════════════════════════════════════════════════╝
 """
@@ -15,11 +16,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pyrogram import Client
+from pyrogram import Client, enums
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait, RPCError
 
-from translator import translate_to_english
+from translator import translate_to_english, format_html_and_translate
 
 # ─── Logging ─────────────────────────────────────────
 LOG_DIR = Path(__file__).parent / "logs"
@@ -50,7 +51,6 @@ DEST_CHANNEL = os.getenv("DEST_CHANNEL", "")
 SOURCE_CHANNELS_RAW = os.getenv("SOURCE_CHANNELS", "pk_fns,pk_oa")
 SOURCE_CHANNELS = [ch.strip() for ch in SOURCE_CHANNELS_RAW.split(",") if ch.strip()]
 
-# Filter durasi history: default 30 hari (1 bulan)
 HISTORY_DAYS = int(os.getenv("HISTORY_DAYS", "30"))
 
 if SESSION_STRING:
@@ -72,13 +72,30 @@ else:
 
 
 async def send_single_message_translated(dest_id: int, msg: Message) -> bool:
-    """Kirim pesan dengan teks/caption diterjemahkan ke English."""
     for attempt in range(3):
         try:
+            # 1. Pesan teks murni dengan format/link
             if msg.text:
-                text_en = translate_to_english(msg.text)
-                await app.send_message(dest_id, text_en, disable_web_page_preview=False)
+                html_en = format_html_and_translate(msg.text, msg.entities)
+                if len(html_en) > 4000:
+                    chunks = [html_en[i:i+4000] for i in range(0, len(html_en), 4000)]
+                    for chunk in chunks:
+                        await app.send_message(
+                            dest_id,
+                            chunk,
+                            parse_mode=enums.ParseMode.HTML,
+                            disable_web_page_preview=False,
+                        )
+                else:
+                    await app.send_message(
+                        dest_id,
+                        html_en,
+                        parse_mode=enums.ParseMode.HTML,
+                        disable_web_page_preview=False,
+                    )
                 return True
+
+            # 2. Pesan media
             elif (
                 msg.photo
                 or msg.video
@@ -88,9 +105,31 @@ async def send_single_message_translated(dest_id: int, msg: Message) -> bool:
                 or msg.voice
                 or msg.video_note
             ):
-                caption_en = translate_to_english(msg.caption) if msg.caption else None
-                await msg.copy(dest_id, caption=caption_en)
+                caption_en = None
+                overflow_text = None
+                if msg.caption:
+                    caption_en = format_html_and_translate(msg.caption, msg.caption_entities)
+                    if len(caption_en) > 1024:
+                        overflow_text = caption_en
+                        caption_en = caption_en[:1020] + "..."
+
+                copied = await msg.copy(
+                    dest_id,
+                    caption=caption_en,
+                    parse_mode=enums.ParseMode.HTML if caption_en else None,
+                )
+
+                if overflow_text and copied:
+                    reply_id = copied.id if hasattr(copied, "id") else None
+                    await app.send_message(
+                        dest_id,
+                        f"📄 Full Translation:\n\n{overflow_text}",
+                        parse_mode=enums.ParseMode.HTML,
+                        reply_to_message_id=reply_id,
+                    )
                 return True
+
+            # 3. Poll
             elif msg.poll:
                 q_en = translate_to_english(msg.poll.question)
                 opts_en = [translate_to_english(opt.text) for opt in msg.poll.options]
@@ -101,13 +140,14 @@ async def send_single_message_translated(dest_id: int, msg: Message) -> bool:
             else:
                 await msg.copy(dest_id)
                 return True
+
         except FloodWait as e:
-            wait = e.value
-            log.warning(f"⏳ FloodWait: menunggu {wait} detik...")
-            await asyncio.sleep(wait + 1)
+            log.warning(f"⏳ FloodWait: menunggu {e.value} detik...")
+            await asyncio.sleep(e.value + 1)
         except Exception as e:
             log.warning(f"⚠️ Gagal salin pesan ID {msg.id} (attempt {attempt+1}): {e}")
             await asyncio.sleep(1)
+
     return False
 
 
@@ -131,28 +171,21 @@ async def clone_channel_history(source: str, dest_id: int, cutoff_date: datetime
     matched_messages: list[Message] = []
     total_scanned = 0
 
-    # get_chat_history mengambil pesan dari yang terbaru mundur ke yang lama
     async for msg in app.get_chat_history(chat.id):
         total_scanned += 1
-
-        # Pastikan msg.date memiliki timezone UTC
         msg_date = msg.date
         if msg_date.tzinfo is None:
             msg_date = msg_date.replace(tzinfo=timezone.utc)
 
-        # Jika sudah melewati batas 30 hari ke belakang, hentikan scan
         if msg_date < cutoff_date:
-            log.info(f"   Pesan ID {msg.id} bertanggal {msg_date} -> sudah lebih lama dari 30 hari. Berhenti scan.")
             break
 
-        # Simpan pesan yang memenuhi syarat (hanya jika ada konten/media/teks)
         if msg.text or msg.media or msg.poll:
             matched_messages.append(msg)
 
         if total_scanned % 100 == 0:
             log.info(f"   ... {total_scanned} pesan dipindai, {len(matched_messages)} masuk kriteria 1 bulan")
 
-    # Urutkan dari yang terlama ke terbaru (kronologis)
     matched_messages.reverse()
     total = len(matched_messages)
     log.info(f"📊 Total pesan 1 bulan terakhir yang akan disalin: {total}")
@@ -174,7 +207,6 @@ async def clone_channel_history(source: str, dest_id: int, cutoff_date: datetime
                 f"✅ {forwarded} disalin & diterjemahkan, ❌ {failed} gagal"
             )
 
-        # Rate limit aman agar terhindar dari spam limitation Telegram
         await asyncio.sleep(0.8)
 
     return {

@@ -3,6 +3,7 @@
 ║  TELEGRAM CHANNEL CLONER + AUTO TRANSLATOR           ║
 ║  - Sumber: @pk_fns, @pk_oa                           ║
 ║  - Terjemahan Otomatis: Mandarin/Cina -> English     ║
+║  - Preservasi Hyperlink & Referral Links Asli (HTML) ║
 ║  - Support: PC Lokal & GitHub Actions 24/7           ║
 ║  - Auto-retrigger sebelum limit 6 jam GitHub selesai ║
 ║  - Smart Caption Truncation (>1024 chars)            ║
@@ -20,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 from pyrogram.errors import (
     FloodWait,
@@ -29,7 +30,7 @@ from pyrogram.errors import (
     RPCError,
 )
 
-from translator import translate_to_english
+from translator import translate_to_english, format_html_and_translate
 
 # ─── Logging Setup ───────────────────────────────────
 LOG_DIR = Path(__file__).parent / "logs"
@@ -59,7 +60,6 @@ SESSION_STRING = os.getenv("SESSION_STRING", "")
 DEST_CHANNEL = os.getenv("DEST_CHANNEL", "")
 SOURCE_CHANNELS_RAW = os.getenv("SOURCE_CHANNELS", "pk_fns,pk_oa")
 
-# GitHub Actions auto-retrigger config
 IS_GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
 GH_TOKEN = os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN", "")
 GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "")
@@ -170,23 +170,32 @@ async def resolve_channels() -> None:
         sys.exit(1)
 
 
-# ─── Kirim Pesan dengan Terjemahan Bahasa Inggris ─────
+# ─── Kirim Pesan dengan Terjemahan Bahasa Inggris & Hyperlink ───
 async def copy_with_translation(msg: Message) -> bool:
     for attempt in range(3):
         try:
-            # 1. Pesan teks
+            # 1. Pesan teks murni (termasuk yang memiliki hyperlink / bold / format)
             if msg.text:
-                translated_text = translate_to_english(msg.text)
-                if translated_text != msg.text:
-                    stats.translated += 1
+                translated_html = format_html_and_translate(msg.text, msg.entities)
+                stats.translated += 1
 
-                # Jika teks > 4096 (batas Telegram), kirim bertahap
-                if len(translated_text) > 4000:
-                    chunks = [translated_text[i:i+4000] for i in range(0, len(translated_text), 4000)]
+                # Jika panjang melebihi 4000 karakter, kirim bertahap
+                if len(translated_html) > 4000:
+                    chunks = [translated_html[i:i+4000] for i in range(0, len(translated_html), 4000)]
                     for chunk in chunks:
-                        await app.send_message(chat_id=dest_chat_id, text=chunk, disable_web_page_preview=False)
+                        await app.send_message(
+                            chat_id=dest_chat_id,
+                            text=chunk,
+                            parse_mode=enums.ParseMode.HTML,
+                            disable_web_page_preview=False,
+                        )
                 else:
-                    await app.send_message(chat_id=dest_chat_id, text=translated_text, disable_web_page_preview=False)
+                    await app.send_message(
+                        chat_id=dest_chat_id,
+                        text=translated_html,
+                        parse_mode=enums.ParseMode.HTML,
+                        disable_web_page_preview=False,
+                    )
                 return True
 
             # 2. Pesan media (foto, video, dokumen, audio, animasi)
@@ -201,24 +210,30 @@ async def copy_with_translation(msg: Message) -> bool:
             ):
                 new_caption = None
                 overflow_text = None
+
                 if msg.caption:
-                    new_caption = translate_to_english(msg.caption)
-                    if new_caption != msg.caption:
-                        stats.translated += 1
+                    new_caption = format_html_and_translate(msg.caption, msg.caption_entities)
+                    stats.translated += 1
 
                     # Handle batas caption media Telegram (1024 karakter)
                     if len(new_caption) > 1024:
                         overflow_text = new_caption
                         new_caption = new_caption[:1020] + "..."
 
-                copied = await msg.copy(chat_id=dest_chat_id, caption=new_caption)
+                copied = await msg.copy(
+                    chat_id=dest_chat_id,
+                    caption=new_caption,
+                    parse_mode=enums.ParseMode.HTML if new_caption else None,
+                )
 
-                # Jika ada teks panjang yang terpotong di caption, kirim pesan lanjutan
+                # Jika caption terpotong, kirim pesan lanjutan teks lengkap
                 if overflow_text and copied:
+                    reply_id = copied.id if hasattr(copied, "id") else None
                     await app.send_message(
                         chat_id=dest_chat_id,
                         text=f"📄 Full Translation:\n\n{overflow_text}",
-                        reply_to_message_id=copied.id if hasattr(copied, "id") else None,
+                        parse_mode=enums.ParseMode.HTML,
+                        reply_to_message_id=reply_id,
                     )
                 return True
 
