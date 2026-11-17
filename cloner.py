@@ -5,6 +5,7 @@
 ║  - Terjemahan Otomatis: Mandarin/Cina -> English     ║
 ║  - Support: PC Lokal & GitHub Actions 24/7           ║
 ║  - Auto-retrigger sebelum limit 6 jam GitHub selesai ║
+║  - Smart Caption Truncation (>1024 chars)            ║
 ╚══════════════════════════════════════════════════════╝
 """
 
@@ -64,7 +65,6 @@ GH_TOKEN = os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN", "")
 GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "")
 GITHUB_REF_NAME = os.getenv("GITHUB_REF_NAME", "main")
 WORKFLOW_FILE = os.getenv("WORKFLOW_FILE", "cloner.yml")
-# Batas waktu jalan di GitHub Actions: default 330 menit (5.5 jam, aman sebelum 6 jam)
 MAX_RUNTIME_MINUTES = int(os.getenv("MAX_RUNTIME_MINUTES", "330"))
 
 SOURCE_CHANNELS: list[str] = [
@@ -75,20 +75,16 @@ SOURCE_CHANNELS: list[str] = [
 def validate_config() -> None:
     errors = []
     if API_ID == 0:
-        errors.append("API_ID belum diisi di .env atau GitHub Secrets")
+        errors.append("API_ID belum diisi")
     if not API_HASH:
-        errors.append("API_HASH belum diisi di .env atau GitHub Secrets")
+        errors.append("API_HASH belum diisi")
     if not DEST_CHANNEL:
-        errors.append("DEST_CHANNEL belum diisi di .env atau GitHub Secrets")
+        errors.append("DEST_CHANNEL belum diisi")
     if not SOURCE_CHANNELS:
-        errors.append("SOURCE_CHANNELS kosong di .env atau GitHub Secrets")
+        errors.append("SOURCE_CHANNELS kosong")
 
-    # Jika di GitHub Actions, SESSION_STRING wajib ada (karena tidak bisa input OTP terminal)
     if IS_GITHUB_ACTIONS and not SESSION_STRING:
-        errors.append(
-            "Di GitHub Actions, SESSION_STRING wajib diisi di GitHub Secrets!\n"
-            "Jalankan 'python generate_session.py' di PC lokal untuk membuatnya."
-        )
+        errors.append("SESSION_STRING wajib diisi untuk GitHub Actions!")
 
     if errors:
         for e in errors:
@@ -176,22 +172,21 @@ async def resolve_channels() -> None:
 
 # ─── Kirim Pesan dengan Terjemahan Bahasa Inggris ─────
 async def copy_with_translation(msg: Message) -> bool:
-    """
-    Menyalin konten pesan ke channel tujuan dengan teks/caption
-    diterjemahkan secara otomatis ke Bahasa Inggris.
-    """
     for attempt in range(3):
         try:
-            # 1. Pesan hanya teks biasa
+            # 1. Pesan teks
             if msg.text:
                 translated_text = translate_to_english(msg.text)
                 if translated_text != msg.text:
                     stats.translated += 1
-                await app.send_message(
-                    chat_id=dest_chat_id,
-                    text=translated_text,
-                    disable_web_page_preview=False,
-                )
+
+                # Jika teks > 4096 (batas Telegram), kirim bertahap
+                if len(translated_text) > 4000:
+                    chunks = [translated_text[i:i+4000] for i in range(0, len(translated_text), 4000)]
+                    for chunk in chunks:
+                        await app.send_message(chat_id=dest_chat_id, text=chunk, disable_web_page_preview=False)
+                else:
+                    await app.send_message(chat_id=dest_chat_id, text=translated_text, disable_web_page_preview=False)
                 return True
 
             # 2. Pesan media (foto, video, dokumen, audio, animasi)
@@ -205,16 +200,26 @@ async def copy_with_translation(msg: Message) -> bool:
                 or msg.video_note
             ):
                 new_caption = None
+                overflow_text = None
                 if msg.caption:
                     new_caption = translate_to_english(msg.caption)
                     if new_caption != msg.caption:
                         stats.translated += 1
 
-                # Salin media dengan caption baru dalam bahasa Inggris
-                await msg.copy(
-                    chat_id=dest_chat_id,
-                    caption=new_caption,
-                )
+                    # Handle batas caption media Telegram (1024 karakter)
+                    if len(new_caption) > 1024:
+                        overflow_text = new_caption
+                        new_caption = new_caption[:1020] + "..."
+
+                copied = await msg.copy(chat_id=dest_chat_id, caption=new_caption)
+
+                # Jika ada teks panjang yang terpotong di caption, kirim pesan lanjutan
+                if overflow_text and copied:
+                    await app.send_message(
+                        chat_id=dest_chat_id,
+                        text=f"📄 Full Translation:\n\n{overflow_text}",
+                        reply_to_message_id=copied.id if hasattr(copied, "id") else None,
+                    )
                 return True
 
             # 3. Pesan Poll
@@ -230,20 +235,19 @@ async def copy_with_translation(msg: Message) -> bool:
                 )
                 return True
 
-            # 4. Tipe lainnya (sticker, location, contact, dsb)
+            # 4. Tipe lainnya
             else:
                 await msg.copy(chat_id=dest_chat_id)
                 return True
 
         except FloodWait as e:
-            wait_time = e.value
-            log.warning(f"⏳ FloodWait: menunggu {wait_time} detik...")
-            await asyncio.sleep(wait_time + 1)
+            log.warning(f"⏳ FloodWait: tunggu {e.value} detik...")
+            await asyncio.sleep(e.value + 1)
         except ChatWriteForbidden:
             log.error("❌ Akun tidak memiliki izin menulis di channel tujuan! Jadikan admin.")
             return False
         except MessageIdInvalid:
-            log.warning("⚠️ Pesan telah dihapus dari channel sumber sebelum diproses.")
+            log.warning("⚠️ Pesan telah dihapus dari channel sumber.")
             return False
         except RPCError as e:
             log.warning(f"⚠️ RPC Error (attempt {attempt+1}): {e}")
@@ -286,10 +290,6 @@ async def on_edited_channel_message(client: Client, message: Message) -> None:
 
 # ─── GitHub Actions Self-Retrigger Mechanism ─────────
 def trigger_next_github_run() -> bool:
-    """
-    Memanggil GitHub API workflow_dispatch untuk memulai run baru
-    sebelum run yang sekarang habis masa 6 jam.
-    """
     if not GH_TOKEN or not GITHUB_REPOSITORY:
         log.warning("⚠️ GH_TOKEN atau GITHUB_REPOSITORY tidak ditemukan, skip auto-retrigger API.")
         return False
@@ -323,10 +323,6 @@ def trigger_next_github_run() -> bool:
 
 
 async def runtime_watcher(stop_event: asyncio.Event) -> None:
-    """
-    Memantau runtime di GitHub Actions.
-    Jika mendekati limit (misal 5.5 jam), trigger run baru lalu hentikan proses ini.
-    """
     if not IS_GITHUB_ACTIONS:
         return
 
@@ -342,7 +338,6 @@ async def runtime_watcher(stop_event: asyncio.Event) -> None:
         if elapsed >= limit_seconds:
             log.info("⏰ Waktu runtime 5.5 jam tercapai! Memulai regenerasi workflow...")
             trigger_next_github_run()
-            # Beri jeda 10 detik agar workflow baru sempat initialized di GitHub
             await asyncio.sleep(10)
             stop_event.set()
             break
@@ -368,7 +363,6 @@ async def main() -> None:
         log.info(f"   ↳ Konten diterjemahkan ke English -> {DEST_CHANNEL}")
         log.info("")
 
-        # Jalankan watcher runtime jika di GitHub Actions
         watcher_task = asyncio.create_task(runtime_watcher(stop_event))
 
         try:
